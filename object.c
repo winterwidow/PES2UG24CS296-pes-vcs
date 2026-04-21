@@ -94,9 +94,73 @@ int object_exists(const ObjectID *id) {
 //
 // Returns 0 on success, -1 on error.
 int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out) {
-    // TODO: Implement
-    (void)type; (void)data; (void)len; (void)id_out;
-    return -1;
+    // Step 1: create header "<type> <size>\0"
+    const char *type_str =
+        (type == OBJ_BLOB) ? "blob" :
+        (type == OBJ_TREE) ? "tree" : "commit";
+
+    char header[64];
+    int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len) + 1;
+
+    size_t total_len = header_len + len;
+    unsigned char *buffer = malloc(total_len);
+
+    memcpy(buffer, header, header_len);
+    memcpy(buffer + header_len, data, len);
+
+    // Step 2: compute hash
+    compute_hash(buffer, total_len, id_out);
+
+    // Step 3: check if already exists
+    if (object_exists(id_out)) {
+        free(buffer);
+        return 0;
+    }
+
+    // Step 4: create directory
+    char path[512];
+    object_path(id_out, path, sizeof(path));
+
+    char dir[512];
+    strncpy(dir, path, sizeof(dir));
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+
+    // Step 5: temp file path
+    char temp_path[512];
+    snprintf(temp_path, sizeof(temp_path), "%s.tmp", path);
+
+    // Step 6: write temp file
+    int fd = open(temp_path, O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        free(buffer);
+        return -1;
+    }
+
+    if (write(fd, buffer, total_len) != (ssize_t)total_len) {
+        close(fd);
+        free(buffer);
+        return -1;
+    }
+
+    fsync(fd);
+    close(fd);
+
+    // Step 7: rename (atomic)
+    rename(temp_path, path);
+
+    // Step 8: fsync directory
+    int dir_fd = open(dir, O_DIRECTORY);
+    if (dir_fd >= 0) {
+        fsync(dir_fd);
+        close(dir_fd);
+    }
+
+    free(buffer);
+    return 0;
 }
 
 // Read an object from the store.
@@ -111,8 +175,7 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 //   6. Allocate a buffer, copy the data portion (after the \0), set *data_out and *len_out
 //
 // HINTS - Useful syscalls and functions for this phase:
-//   - object_path        : getting the target file path
-//   - fopen, fread, fseek: reading the file into memory
+//   - object_path        : getting the target file path//   - fopen, fread, fseek: reading the file into memory
 //   - memchr             : safely finding the '\0' separating header and data
 //   - strncmp            : parsing the type string ("blob", "tree", "commit")
 //   - compute_hash       : re-hashing the read data for integrity verification
@@ -122,7 +185,48 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
 // The caller is responsible for calling free(*data_out).
 // Returns 0 on success, -1 on error (file not found, corrupt, etc.).
 int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out) {
-    // TODO: Implement
-    (void)id; (void)type_out; (void)data_out; (void)len_out;
-    return -1;
+    char path[512];
+    object_path(id, path, sizeof(path));
+
+    FILE *f = fopen(path, "rb");
+    if (!f) return -1;
+
+    // get file size
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    rewind(f);
+
+    unsigned char *buffer = malloc(size);
+    fread(buffer, 1, size, f);
+    fclose(f);
+
+    // verify hash
+    ObjectID computed;
+    compute_hash(buffer, size, &computed);
+
+    if (memcmp(computed.hash, id->hash, HASH_SIZE) != 0) {
+        free(buffer);
+        return -1;
+    }
+
+    // parse header
+    char *null_pos = memchr(buffer, '\0', size);
+    if (!null_pos) {
+        free(buffer);
+        return -1;
+    }
+
+    char type_str[10];
+    sscanf((char *)buffer, "%s %zu", type_str, len_out);
+
+    if (strcmp(type_str, "blob") == 0) *type_out = OBJ_BLOB;
+    else if (strcmp(type_str, "tree") == 0) *type_out = OBJ_TREE;
+    else *type_out = OBJ_COMMIT;
+
+    // extract data
+    *data_out = malloc(*len_out);
+    memcpy(*data_out, null_pos + 1, *len_out);
+
+    free(buffer);
+    return 0;
 }
